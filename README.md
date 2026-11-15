@@ -162,8 +162,8 @@ the commit message:
 
 release-please keeps a release PR open that bumps the version and
 `CHANGELOG.md`. Merging it publishes the GitHub release and moves the `v0` tag.
-The workflow needs a `RELEASE_TOKEN` secret with contents, pull requests and
-issues write access.
+The workflow needs a `RELEASE_TOKEN` secret with contents, workflows, pull
+requests and issues write access.
 
 ## License
 

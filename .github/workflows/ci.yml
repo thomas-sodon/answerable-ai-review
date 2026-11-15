@@ -51,8 +51,9 @@ jobs:
       cancel-in-progress: false
     steps:
       # A release PR opened with GITHUB_TOKEN would get no CI runs, so Mergify
-      # could never merge it. RELEASE_TOKEN needs contents, pull requests and
-      # issues (labels) write access.
+      # could never merge it. RELEASE_TOKEN needs contents, workflows, pull
+      # requests and issues (labels) write access; workflows because GitHub can
+      # refuse to move a tag onto commits that change workflow files without it.
       - name: Require RELEASE_TOKEN
         env:
           RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
@@ -62,12 +63,17 @@ jobs:
             exit 1
           fi
       - uses: actions/checkout@v5
+        with:
+          # Full history, to find the commit that set the manifest version.
+          fetch-depth: 0
       # A version bumped by hand (all three files, which tests/test_version.py
       # checks) must be released before release-please runs: release-please only
       # accepts a release whose tag matches the manifest version, and without one
       # it re-reads up to 500 commits and opens a release PR listing all of them.
-      # A merged release-please PR (labelled autorelease: pending/tagged) is
-      # skipped here; release-please tags those itself in the next step.
+      # Versions from a release-please PR are left to release-please, which tags
+      # every merged PR still labelled "autorelease: pending" on whichever push it
+      # next runs: the commit that set the version came from such a PR, or one is
+      # waiting (its own job failed, or this concurrency group dropped it).
       - name: Release a hand-bumped version
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
@@ -77,16 +83,24 @@ jobs:
             echo "Release $TAG already exists"
             exit 0
           fi
-          labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '[.[].labels[].name] | join(",")')
+          pending=$(gh pr list --state merged --base main --label "autorelease: pending" --json number --jq length)
+          if [ "$pending" -gt 0 ]; then
+            echo "A merged release-please PR is waiting to be tagged; release-please creates $TAG"
+            exit 0
+          fi
+          # Release from the commit that set the version, not this push: a later
+          # merge may have landed before this job ran.
+          sha=$(git log -1 --format=%H -- .release-please-manifest.json)
+          labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/pulls" --jq '[.[].labels[].name] | join(",")')
           case ",$labels," in
             *",autorelease: pending,"* | *",autorelease: tagged,"*)
-              echo "This push merges a release-please PR; release-please creates $TAG"
+              echo "$sha merged a release-please PR; release-please creates $TAG"
               exit 0 ;;
           esac
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --silent 2>/dev/null; then
             gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes --latest
           else
-            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --generate-notes --latest
+            gh release create "$TAG" --target "$sha" --title "$TAG" --generate-notes --latest
           fi
       - uses: googleapis/release-please-action@v5
         with:
