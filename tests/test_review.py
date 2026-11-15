@@ -13,9 +13,13 @@ from answerable.markers import _FIXED_LOCALLY_MARKER
 from answerable.review import (
     _AI_FINDING_RE,
     _OVERFLOW_ACK_SENTINEL,
+    _OVERFLOW_ANSWER_HINT,
     _OVERFLOW_LEGACY_HEADER,
     _OVERFLOW_SENTINEL_CLOSE,
     _OVERFLOW_SENTINEL_OPEN,
+    ACK_IN_REVIEW,
+    ACK_NOT_FIRST,
+    ACK_WITHOUT_VERDICT,
     OverflowFinding,
     PostReviewResult,
     PRReviewer,
@@ -28,6 +32,8 @@ from answerable.review import (
     _normalize_title,
     _overflow_fingerprint,
     _parse_overflow_ack,
+    _parse_overflow_ack_listed,
+    _parse_overflow_ack_trailing,
     _parse_overflow_findings,
 )
 from answerable.sdk import QueryResult, QueryUsage
@@ -712,6 +718,47 @@ def test_build_review_payload_mixed() -> None:
     assert "Additional findings" in payload["body"]
 
 
+def test_build_review_payload_says_how_to_answer_overflow_findings() -> None:
+    """Overflow findings have no thread to reply on, so the body says an answer
+    has a set form and where it is described, after the sentinel pair so the
+    parsed block is unchanged; a body with no overflow findings says nothing."""
+    reviewer = _reviewer()
+    finding = ReviewFinding(file="a.py", line=99, severity="nit", title="Off-hunk",
+                            description="Not in diff", fix_plan="Fix")
+
+    body = reviewer._build_review_payload([finding], {"a.py": {1}}, "Summary")["body"]
+
+    assert body.index(_OVERFLOW_SENTINEL_CLOSE) < body.index(_OVERFLOW_ANSWER_HINT)
+    assert "docs/REFERENCE.md" in _OVERFLOW_ANSWER_HINT
+    assert "\n" not in _OVERFLOW_ANSWER_HINT
+    assert [f.title for f in _parse_overflow_findings(body)] == ["Off-hunk"]
+    assert _OVERFLOW_ANSWER_HINT not in reviewer._build_review_payload([], {}, "All good")["body"]
+
+
+def test_review_body_quoted_in_a_comment_acknowledges_nothing() -> None:
+    """The reviewer never writes the roll-up marker into its own review.  If it
+    did, a PR comment quoting the review would be read as a roll-up, and a
+    quoted finding whose text happens to hold a verdict phrase would count as
+    answered: the gate would pass on a finding nobody answered."""
+    host = MagicMock()
+    host.get_pr_review_threads.return_value = []
+    reviewer = _reviewer(host)
+    finding = ReviewFinding(file="index.py", line=51, severity="bug", title="Stale TODO",
+                            description="The TODO says it is Tracked in #12, but that issue is closed",
+                            fix_plan="f")
+    body = reviewer._build_review_payload([finding], {}, "Summary")["body"]
+    assert _OVERFLOW_ACK_SENTINEL not in body
+    host.get_pr_review_bodies.return_value = [body]
+    quoted = "\n".join(f"> {line}" for line in body.splitlines()) + "\n\nCan someone explain this one?"
+    host.get_pr_comment_bodies.return_value = [quoted]
+
+    report = reviewer.find_unreplied_comments(3)
+
+    assert _parse_overflow_ack([quoted]) == set()
+    assert [f.fingerprint for f in report.overflow] == [_overflow_fingerprint(finding)]
+    assert report.overflow_notes == {}
+
+
 def test_build_review_payload_disclaimer() -> None:
     """Review body always ends with the footer naming the tool and the gate."""
     reviewer = _reviewer()
@@ -1184,6 +1231,37 @@ def test_parse_overflow_ack_collects_only_first_handle_per_line() -> None:
     acked = _parse_overflow_ack([body])
 
     assert acked == {"of-aaaaaaaa"}
+
+
+def test_parse_overflow_ack_listed_ignores_the_verdict() -> None:
+    """The first handle on every line of a roll-up body is "listed", verdict or
+    not; a body without the sentinel lists nothing.  This is what lets the gate
+    tell "nobody answered" from "someone answered in a way that is not counted"."""
+    body = (
+        f"{_OVERFLOW_ACK_SENTINEL}\n"
+        "- of-aaaaaaaa — Fixed automatically (was a dup of of-dddddddd)\n"
+        "- of-bbbbbbbb — Fixed in 1a2b3c4: the row is now indexed\n"
+        "prose with no handle\n"
+    )
+
+    assert _parse_overflow_ack_listed([body, "of-cccccccc in an ordinary comment"]) == {
+        "of-aaaaaaaa", "of-bbbbbbbb",
+    }
+    assert _parse_overflow_ack_listed([]) == set()
+
+
+def test_parse_overflow_ack_trailing_is_every_handle_after_the_first_on_a_verdict_line() -> None:
+    """Only the first handle on a verdict line is counted, so the ones after it
+    are the ones whose author needs telling; a line with no verdict has none."""
+    body = (
+        f"{_OVERFLOW_ACK_SENTINEL}\n"
+        "- of-aaaaaaaa, of-bbbbbbbb and of-cccccccc — Fixed automatically in 1a2b3c4\n"
+        "- of-dddddddd, of-eeeeeeee — Fixed in 1a2b3c4\n"
+    )
+
+    assert _parse_overflow_ack([body]) == {"of-aaaaaaaa"}
+    assert _parse_overflow_ack_trailing([body]) == {"of-bbbbbbbb", "of-cccccccc"}
+    assert _parse_overflow_ack_trailing(["of-aaaaaaaa, of-bbbbbbbb — Fixed automatically"]) == set()
 
 
 def test_parse_overflow_ack_empty() -> None:
@@ -2154,6 +2232,110 @@ def test_find_unreplied_comments_acceptance_matrix() -> None:
     assert report.inline[0].path == "a.py"
     assert [f.fingerprint for f in report.overflow] == [_overflow_fingerprint(of_open)]
     assert report.overflow[0].file == "f.py"
+
+
+def _overflow_host(reviewer_host: MagicMock, reviewer: PRReviewer) -> ReviewFinding:
+    """Give *reviewer_host* one review carrying one overflow finding; return it."""
+    finding = ReviewFinding(file="index.py", line=51, severity="suggestion",
+                            title="Short rows are dropped", description="d", fix_plan="f")
+    reviewer_host.get_pr_review_threads.return_value = []
+    reviewer_host.get_pr_review_bodies.return_value = [
+        reviewer._build_review_payload([finding], {}, "Summary")["body"],
+    ]
+    reviewer_host.get_pr_comment_bodies.return_value = []
+    return finding
+
+
+def test_find_unreplied_comments_notes_an_ack_without_a_verdict() -> None:
+    """An acknowledgement in plain words ("Fixed in <commit>") is not counted —
+    its line carries none of the verdict phrases — and the report says so, so
+    the gate can tell its author instead of failing without a reason."""
+    host = MagicMock()
+    reviewer = _reviewer(host)
+    fp = _overflow_fingerprint(_overflow_host(host, reviewer))
+    host.get_pr_comment_bodies.return_value = [
+        f"{_OVERFLOW_ACK_SENTINEL}\nAnswers:\n\n- {fp} — Fixed in d71aaa8: short rows are indexed now.",
+    ]
+
+    report = reviewer.find_unreplied_comments(3)
+
+    assert [f.fingerprint for f in report.overflow] == [fp]
+    assert report.overflow_notes == {fp: ACK_WITHOUT_VERDICT}
+
+
+@pytest.mark.parametrize("verdict", ["Fixed automatically in d71aaa8", "Fixed in d71aaa8: short rows are indexed now."])
+def test_find_unreplied_comments_notes_an_ack_submitted_as_a_review(verdict: str) -> None:
+    """A roll-up submitted as a review is not read (only PR comments are), with
+    or without a valid verdict; the report names that, since a review re-runs
+    the gate and so looks like the place to answer."""
+    host = MagicMock()
+    reviewer = _reviewer(host)
+    fp = _overflow_fingerprint(_overflow_host(host, reviewer))
+    host.get_pr_review_bodies.return_value = [
+        *host.get_pr_review_bodies.return_value,
+        f"{_OVERFLOW_ACK_SENTINEL}\n- {fp} — {verdict}",
+    ]
+
+    report = reviewer.find_unreplied_comments(3)
+
+    assert [f.fingerprint for f in report.overflow] == [fp]
+    assert report.overflow_notes == {fp: ACK_IN_REVIEW}
+
+
+def test_find_unreplied_comments_notes_a_handle_that_is_not_first_on_its_line() -> None:
+    """Two findings answered on one line: the first is answered, the second is
+    not, and the report says why — its author followed the form in every other
+    way."""
+    host = MagicMock()
+    reviewer = _reviewer(host)
+    first = ReviewFinding(file="index.py", line=51, severity="suggestion",
+                          title="Short rows are dropped", description="d", fix_plan="f")
+    second = ReviewFinding(file="index.py", line=80, severity="bug",
+                           title="Blank dates are dropped", description="d", fix_plan="f")
+    host.get_pr_review_threads.return_value = []
+    host.get_pr_review_bodies.return_value = [
+        reviewer._build_review_payload([first, second], {}, "Summary")["body"],
+    ]
+    fp_first, fp_second = _overflow_fingerprint(first), _overflow_fingerprint(second)
+    host.get_pr_comment_bodies.return_value = [
+        f"{_OVERFLOW_ACK_SENTINEL}\n- {fp_first}, {fp_second} — Fixed automatically in d71aaa8",
+    ]
+
+    report = reviewer.find_unreplied_comments(3)
+
+    assert [f.fingerprint for f in report.overflow] == [fp_second]
+    assert report.overflow_notes == {fp_second: ACK_NOT_FIRST}
+
+
+def test_find_unreplied_comments_notes_nothing_when_nobody_acknowledged() -> None:
+    """A finding nobody tried to acknowledge gets no note: the reviewer's own
+    review body, which lists the handle, is not an acknowledgement of it."""
+    host = MagicMock()
+    reviewer = _reviewer(host)
+    fp = _overflow_fingerprint(_overflow_host(host, reviewer))
+
+    report = reviewer.find_unreplied_comments(3)
+
+    assert [f.fingerprint for f in report.overflow] == [fp]
+    assert report.overflow_notes == {}
+
+
+def test_find_unreplied_comments_notes_never_change_what_is_reported() -> None:
+    """A valid acknowledgement answers the finding and leaves no note, and the
+    review bodies are not fetched a second time when nothing is unanswered."""
+    host = MagicMock()
+    reviewer = _reviewer(host)
+    fp = _overflow_fingerprint(_overflow_host(host, reviewer))
+    host.get_pr_comment_bodies.return_value = [
+        f"{_OVERFLOW_ACK_SENTINEL}\n- {fp} — Fixed in d71aaa8",
+        f"{_OVERFLOW_ACK_SENTINEL}\n- {fp} — Fixed automatically in d71aaa8",
+    ]
+
+    report = reviewer.find_unreplied_comments(3)
+
+    assert report.overflow == []
+    assert report.overflow_notes == {}
+    assert host.get_pr_review_bodies.call_count == 1
 
 
 def test_find_unreplied_comments_outdated_thread_exempt() -> None:

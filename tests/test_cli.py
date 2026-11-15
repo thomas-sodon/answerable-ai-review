@@ -11,11 +11,17 @@ from unittest.mock import patch
 import pytest
 
 from answerable import cli as review_pr_mod
+from answerable.markers import _ALL_COMMENT_TERMINAL_MARKERS
 from answerable.review import (
+    _OVERFLOW_ACK_SENTINEL,
+    ACK_IN_REVIEW,
+    ACK_NOT_FIRST,
+    ACK_WITHOUT_VERDICT,
     OverflowFinding,
     PostReviewResult,
     ReviewThread,
     UnrepliedComments,
+    _parse_overflow_ack,
 )
 
 # ---------------------------------------------------------------------------
@@ -664,6 +670,102 @@ class TestRequireCommentReplies:
         assert "Unreplied inline comment: a.py — Bare finding" in caplog.text
         assert "Unreplied overflow comment: of-abc12345 b.py:10" in caplog.text
         assert "Failing review: 2 unreplied comment(s)" in caplog.text
+
+    @pytest.mark.parametrize("in_actions", [True, False])
+    def test_unanswered_overflow_finding_says_how_to_answer(
+        self,
+        in_actions: bool,
+        caplog: pytest.LogCaptureFixture,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An overflow finding has no thread, so the failing gate spells out
+        what an answer is — the marker, the handle and every verdict phrase — in
+        the log, and as an error annotation when it runs in GitHub Actions."""
+        if in_actions:
+            monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        else:
+            monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        report = UnrepliedComments(overflow=[self._overflow()])
+
+        with (
+            patch.object(sys, "argv", [*BASE_ARGV, "--require-comment-replies"]),
+            patch("answerable.cli.PRReviewer") as mock_cls,
+            caplog.at_level(logging.INFO, logger="answerable.cli"),
+        ):
+            mock_cls.return_value.find_unreplied_comments.return_value = report
+            with pytest.raises(SystemExit) as exc:
+                review_pr_mod.main()
+
+        assert exc.value.code == 1
+        how_to = review_pr_mod._OVERFLOW_ANSWER_HELP
+        assert how_to in caplog.text
+        assert _OVERFLOW_ACK_SENTINEL in how_to
+        assert "not a review" in how_to
+        assert "of-<hash> handle" in how_to
+        assert "only the first handle on a line is counted" in how_to
+        for phrase in _ALL_COMMENT_TERMINAL_MARKERS:
+            assert phrase in how_to
+        assert "\n" not in how_to, "an Actions annotation is one line"
+        assert how_to.isascii(), "stdout is not UTF-8 on every runner"
+        # The example it gives is one the gate counts.
+        example = how_to.split("Example line: ", 1)[1].split(". One finding", 1)[0]
+        assert _parse_overflow_ack([f"{_OVERFLOW_ACK_SENTINEL}\n- {example}"]) == {"of-1a2b3c4d"}
+        assert "an acknowledgement" not in caplog.text, "nobody tried to acknowledge it"
+        out = capsys.readouterr().out
+        assert (f"::error title=Answerable::{how_to}" in out) is in_actions
+
+    @pytest.mark.parametrize(("reason", "expected"), [
+        (ACK_WITHOUT_VERDICT, "of-abc12345: an acknowledgement comment lists this handle, but on a line with none"),
+        (ACK_NOT_FIRST, "of-abc12345: an acknowledgement comment lists this handle after another one on the same line"),
+        (ACK_IN_REVIEW, "of-abc12345: an acknowledgement for this handle was submitted as a review"),
+    ])
+    def test_uncounted_acknowledgement_is_explained(
+        self, reason: str, expected: str, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """When someone did write an acknowledgement that the gate does not
+        count, the log says which finding and why, next to its unreplied line."""
+        report = UnrepliedComments(
+            overflow=[self._overflow()],
+            overflow_notes={"of-abc12345": reason},
+        )
+
+        with (
+            patch.object(sys, "argv", [*BASE_ARGV, "--require-comment-replies"]),
+            patch("answerable.cli.PRReviewer") as mock_cls,
+            caplog.at_level(logging.INFO, logger="answerable.cli"),
+        ):
+            mock_cls.return_value.find_unreplied_comments.return_value = report
+            with pytest.raises(SystemExit) as exc:
+                review_pr_mod.main()
+
+        assert exc.value.code == 1
+        assert "Unreplied overflow comment: of-abc12345 b.py:10" in caplog.text
+        assert expected in caplog.text
+        lines = [record.getMessage() for record in caplog.records]
+        at = lines.index("Unreplied overflow comment: of-abc12345 b.py:10")
+        assert expected in lines[at + 1], "the reason follows its finding's line"
+
+    def test_inline_only_failure_does_not_mention_overflow(
+        self, caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unanswered inline thread is answered by replying on it; the
+        overflow instructions would only be noise there."""
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        report = UnrepliedComments(inline=[self._thread("🐛 **Bare finding**\nDetails")])
+
+        with (
+            patch.object(sys, "argv", [*BASE_ARGV, "--require-comment-replies"]),
+            patch("answerable.cli.PRReviewer") as mock_cls,
+            caplog.at_level(logging.INFO, logger="answerable.cli"),
+        ):
+            mock_cls.return_value.find_unreplied_comments.return_value = report
+            with pytest.raises(SystemExit):
+                review_pr_mod.main()
+
+        assert review_pr_mod._OVERFLOW_ANSWER_HELP not in caplog.text
+        assert "::error" not in capsys.readouterr().out
 
     def test_no_unreplied_findings_exit_zero(self) -> None:
         """A genuinely empty report → exit 0; review/asyncio.run never called.

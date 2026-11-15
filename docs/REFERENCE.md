@@ -194,7 +194,23 @@ A finding counts as **answered** when:
   phrases: `Could not prove this defect`, `Could not prove this bug`,
   `Fixed automatically`, `Fixed locally with implementation-plan context.`,
   `Tracked in #`, `Declined with implementation-plan context.`,
-  `Answered with implementation-plan context.`
+  `Answered with implementation-plan context.` For example:
+
+  ```markdown
+  <!-- answerable:overflow-ack -->
+  - of-1a2b3c4d — Fixed automatically in abc1234
+  ```
+
+  It has to be a conversation comment, not a review; the phrase has to be on
+  the handle's line (`of-1a2b3c4d — Fixed in abc1234` is not counted); and
+  each finding needs a line of its own, since only the first handle on a line
+  is counted. An overflow finding has no thread to show such a mistake on, so
+  the review body says under its *Additional findings* list that an answer
+  has this form, and a failing gate prints the instructions in its log (and
+  as an error annotation in GitHub Actions). When an acknowledgement was
+  written but not counted, the log also says which finding and why: its line
+  has no verdict phrase, it follows another handle on its line, or it was
+  submitted as a review.
 
 ## Configuration
 

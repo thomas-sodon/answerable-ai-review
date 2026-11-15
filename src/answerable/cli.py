@@ -52,7 +52,43 @@ import sys
 import tomllib
 from pathlib import Path
 
-from answerable.review import PRReviewer, _extract_thread_title
+from answerable.markers import _ALL_COMMENT_TERMINAL_MARKERS
+from answerable.review import (
+    _OVERFLOW_ACK_SENTINEL,
+    ACK_IN_REVIEW,
+    ACK_NOT_FIRST,
+    ACK_WITHOUT_VERDICT,
+    PRReviewer,
+    _extract_thread_title,
+)
+
+# What the reply-coverage gate says about an overflow finding it still counts
+# as unanswered.  One line each and ASCII only: the help is also printed to
+# stdout as a GitHub Actions annotation, which cannot span lines, and stdout is
+# not UTF-8 on every runner.
+_OVERFLOW_ANSWER_HELP = (
+    "To answer an overflow finding, add a PR comment (a conversation comment, "
+    f"not a review) containing {_OVERFLOW_ACK_SENTINEL} and a line with the "
+    "finding's of-<hash> handle and one of these verdict phrases: "
+    + " | ".join(_ALL_COMMENT_TERMINAL_MARKERS)
+    + " Example line: of-1a2b3c4d - Fixed automatically in abc1234. One finding "
+    "per line: only the first handle on a line is counted. Then re-run this check."
+)
+_OVERFLOW_ACK_NOTES = {
+    ACK_WITHOUT_VERDICT: (
+        "an acknowledgement comment lists this handle, but on a line with none "
+        "of the verdict phrases, so it was not counted"
+    ),
+    ACK_NOT_FIRST: (
+        "an acknowledgement comment lists this handle after another one on the "
+        "same line; only the first handle on a line is counted, so give it a "
+        "line of its own"
+    ),
+    ACK_IN_REVIEW: (
+        "an acknowledgement for this handle was submitted as a review; only PR "
+        "conversation comments are read, so it was not counted"
+    ),
+}
 
 # ---------------------------------------------------------------------------
 # Config defaults — optionally loaded from a TOML [review] section and/or
@@ -237,6 +273,17 @@ def main() -> None:
                 "Unreplied overflow comment: %s %s:%d",
                 finding.fingerprint, finding.file, finding.line,
             )
+            note = _OVERFLOW_ACK_NOTES.get(
+                report.overflow_notes.get(finding.fingerprint, ""),
+            )
+            if note:
+                log.error("  %s: %s", finding.fingerprint, note)
+        if report.overflow:
+            # An overflow finding has no thread, so nothing on the PR shows
+            # what an answer looks like or why one was not counted.
+            log.error("%s", _OVERFLOW_ANSWER_HELP)
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                print(f"::error title=Answerable::{_OVERFLOW_ANSWER_HELP}", flush=True)
 
         unreplied = len(report.inline) + len(report.overflow)
         if unreplied:

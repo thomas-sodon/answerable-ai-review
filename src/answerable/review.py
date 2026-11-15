@@ -117,6 +117,28 @@ _OVERFLOW_LEGACY_HEADER = "**Additional findings** (could not be placed inline):
 # Part of the same wire contract: downstream consumers match it verbatim.
 _OVERFLOW_ACK_SENTINEL = "<!-- answerable:overflow-ack -->"
 
+# Printed under the overflow list.  These findings have no thread to reply on,
+# and nothing else on the PR says that an answer has a set form.  Outside the
+# sentinel pair, so it is not part of the block consumers parse.  It must never
+# contain the roll-up marker itself: a PR comment that quotes the review would
+# then be read as a roll-up, and a quoted finding whose own text holds a verdict
+# phrase ("... says it is Tracked in #12 ...") would count as answered.
+_OVERFLOW_ANSWER_HINT = (
+    "*These findings have no thread to reply on. To answer one, add a PR "
+    "comment that lists its `of-…` handle with a verdict phrase, in the form "
+    "[the reference describes](https://github.com/thomas-sodon/answerable-ai-review"
+    "/blob/main/docs/REFERENCE.md#exit-codes). A failing reply-coverage check "
+    "prints the same instructions.*"
+)
+
+# Why an acknowledgement someone wrote for an overflow finding was not counted
+# (:attr:`UnrepliedComments.overflow_notes`).  The roll-up is a strict format
+# with no thread to show a mistake on, so the reply-coverage gate reports these
+# instead of leaving a well-meant answer silently ignored.
+ACK_WITHOUT_VERDICT = "without-verdict"  # listed on a roll-up line with no verdict phrase
+ACK_NOT_FIRST = "not-first"  # after another handle on a verdict line; only the first counts
+ACK_IN_REVIEW = "in-review"  # written in a review body; only PR comments are read
+
 
 def _overflow_fingerprint(finding: ReviewFinding) -> str:
     """Return a compact, stable ``of-<hash8>`` handle for an overflow *finding*.
@@ -369,6 +391,43 @@ def _parse_overflow_ack(comment_bodies: list[str]) -> set[str]:
     return acked
 
 
+def _parse_overflow_ack_listed(bodies: list[str]) -> set[str]:
+    """Return every ``of-<hash>`` handle a roll-up body keys a line to.
+
+    The first handle on each line of a body carrying
+    :data:`_OVERFLOW_ACK_SENTINEL`, whether or not the line has a verdict.  Used
+    only to explain a failing reply-coverage gate: a handle listed here that
+    :func:`_parse_overflow_ack` did not collect was acknowledged in a way the
+    gate does not count, and the person who wrote it needs to be told why.
+    """
+    listed: set[str] = set()
+    for body in bodies:
+        if _OVERFLOW_ACK_SENTINEL not in body:
+            continue
+        for line in body.splitlines():
+            listed.update(_OVERFLOW_ACK_LINE_RE.findall(line)[:1])
+    return listed
+
+
+def _parse_overflow_ack_trailing(comment_bodies: list[str]) -> set[str]:
+    """Return the handles that follow the first one on a roll-up verdict line.
+
+    :func:`_parse_overflow_ack` deliberately counts only the first handle on a
+    line, so ``of-aaaaaaaa, of-bbbbbbbb — Fixed automatically`` answers the
+    first finding and not the second.  Its author has every reason to think it
+    answered both; like :func:`_parse_overflow_ack_listed` this exists only so
+    the gate can say why it did not.
+    """
+    trailing: set[str] = set()
+    for body in comment_bodies:
+        if _OVERFLOW_ACK_SENTINEL not in body:
+            continue
+        for line in body.splitlines():
+            if any(marker in line for marker in _ALL_COMMENT_TERMINAL_MARKERS):
+                trailing.update(_OVERFLOW_ACK_LINE_RE.findall(line)[1:])
+    return trailing
+
+
 def _extract_thread_title(body: str) -> str | None:
     """Return the first markdown bold block in *body*, or ``None``."""
     match = _THREAD_TITLE_RE.search(body)
@@ -517,11 +576,17 @@ class UnrepliedComments:
     AI review threads (root matches :data:`_AI_FINDING_RE`, neither resolved nor
     outdated, no reply, or last reply is the reviewer's own); ``overflow`` holds overflow findings whose ``of-<hash>``
     fingerprint is absent from the acknowledgement roll-up.  Both lists empty
-    means every posted finding has been answered.
+    means every posted finding has been answered.  ``overflow_notes`` explains,
+    for the overflow findings someone did try to acknowledge, why the attempt
+    did not count; it never changes which findings are reported.
     """
 
     inline: list[ReviewThread] = field(default_factory=list)
     overflow: list[OverflowFinding] = field(default_factory=list)
+    # fingerprint -> why an acknowledgement someone wrote for that unanswered
+    # overflow finding was not counted (one of the ``ACK_*`` reasons).  Absent
+    # for a finding nobody tried to acknowledge.
+    overflow_notes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1879,7 +1944,9 @@ class PRReviewer:
                 + "\n"
                 + "\n".join(overflow)
                 + "\n"
-                + _OVERFLOW_SENTINEL_CLOSE,
+                + _OVERFLOW_SENTINEL_CLOSE
+                + "\n"
+                + _OVERFLOW_ANSWER_HINT,
             )
         if filtered:
             items = "\n".join(
@@ -2341,10 +2408,52 @@ class PRReviewer:
         threads = self._parse_review_threads(raw_threads) if raw_threads else []
         inline = [t for t in threads if self._is_unreplied_ai_thread(t)]
 
-        acked = _parse_overflow_ack(self._host.get_pr_comment_bodies(pr_number))
+        comment_bodies = self._host.get_pr_comment_bodies(pr_number)
+        acked = _parse_overflow_ack(comment_bodies)
         overflow = [
             f for f in self._union_overflow_findings(pr_number)
             if not _acking_handles(f) & acked
         ]
 
-        return UnrepliedComments(inline=inline, overflow=overflow)
+        return UnrepliedComments(
+            inline=inline,
+            overflow=overflow,
+            overflow_notes=self._overflow_ack_notes(pr_number, overflow, comment_bodies),
+        )
+
+    def _overflow_ack_notes(
+        self,
+        pr_number: int,
+        unanswered: list[OverflowFinding],
+        comment_bodies: list[str],
+    ) -> dict[str, str]:
+        """Say why acknowledgements written for *unanswered* findings did not count.
+
+        Three mistakes are worth naming, because the roll-up gives no feedback
+        of its own: the handle sits on a roll-up line that has no verdict phrase
+        (:data:`ACK_WITHOUT_VERDICT`); it follows another handle on a verdict
+        line, where only the first is counted (:data:`ACK_NOT_FIRST`); or the
+        roll-up was submitted as a review rather than as a PR comment
+        (:data:`ACK_IN_REVIEW`) — a review re-runs the gate, so it is a natural
+        place to answer, but only comments are read.  The reviewer's own review
+        bodies, the ones carrying an overflow block, are never taken for an
+        acknowledgement.  Reads only, and only when something is unanswered.
+        """
+        if not unanswered:
+            return {}
+        without_verdict = _parse_overflow_ack_listed(comment_bodies)
+        not_first = _parse_overflow_ack_trailing(comment_bodies)
+        in_review = _parse_overflow_ack_listed([
+            body for body in self._host.get_pr_review_bodies(pr_number)
+            if _extract_overflow_block(body) is None
+        ])
+        notes: dict[str, str] = {}
+        for finding in unanswered:
+            handles = _acking_handles(finding)
+            if handles & without_verdict:
+                notes[finding.fingerprint] = ACK_WITHOUT_VERDICT
+            elif handles & not_first:
+                notes[finding.fingerprint] = ACK_NOT_FIRST
+            elif handles & in_review:
+                notes[finding.fingerprint] = ACK_IN_REVIEW
+        return notes
