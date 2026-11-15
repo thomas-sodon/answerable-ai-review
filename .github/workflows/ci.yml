@@ -33,62 +33,99 @@ jobs:
       - name: Pytest
         run: python -m pytest tests/ -v
 
-  # Publish a release when a merge to main carries a version that has no tag
-  # yet: tag vX.Y.Z, create the GitHub release, and move the vX major tag that
-  # users reference (@v0). A merge that leaves the version unchanged is a no-op,
-  # so bump the version in pyproject.toml and src/answerable/__init__.py in the
-  # PR that should ship.
+  # release-please reads the Conventional Commit titles merged to main (see
+  # pr-title.yml) and keeps a release PR open that bumps pyproject.toml,
+  # src/answerable/__init__.py, the manifest and CHANGELOG.md. Merging that PR
+  # tags vX.Y.Z and creates the GitHub release; a later step then moves the vX
+  # major tag that users reference (@v0).
   release:
     needs: quality
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      issues: write
+      pull-requests: write
     concurrency:
       group: release
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.14"
-      - name: Read version
-        id: version
+      # A release PR opened with GITHUB_TOKEN would get no CI runs, so Mergify
+      # could never merge it. RELEASE_TOKEN needs contents, workflows, pull
+      # requests and issues (labels) write access; workflows because GitHub can
+      # refuse to move a tag onto commits that change workflow files without it.
+      - name: Require RELEASE_TOKEN
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
-          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
-          module=$(python -c 'import ast, pathlib; tree = ast.parse(pathlib.Path("src/answerable/__init__.py").read_text()); print(next(n.value.value for n in tree.body if isinstance(n, ast.Assign) and n.targets[0].id == "__version__"))')
-          if [ "$version" != "$module" ]; then
-            echo "::error::pyproject.toml version ($version) does not match __version__ ($module)"
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo "::error::Add a RELEASE_TOKEN secret: release PRs opened with GITHUB_TOKEN get no CI"
             exit 1
           fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "major=v${version%%.*}" >> "$GITHUB_OUTPUT"
-      - name: Create release
+      - uses: actions/checkout@v5
+        with:
+          # Full history, to find the commit that set the manifest version.
+          fetch-depth: 0
+      # A version bumped by hand (all three files, which tests/test_version.py
+      # checks) must be released before release-please runs: release-please only
+      # accepts a release whose tag matches the manifest version, and without one
+      # it re-reads up to 500 commits and opens a release PR listing all of them.
+      # Versions from a release-please PR are left to release-please, which tags
+      # every merged PR still labelled "autorelease: pending" on whichever push it
+      # next runs: the commit that set the version came from such a PR, or one is
+      # waiting (its own job failed, or this concurrency group dropped it).
+      - name: Release a hand-bumped version
         env:
-          # GITHUB_TOKEN by default. If GitHub refuses the tag updates (a tag
-          # ruleset, or workflow-file changes the token may not publish), add a
-          # RELEASE_TOKEN secret with contents and workflows write and re-run.
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
-          TAG: v${{ steps.version.outputs.version }}
-          MAJOR: ${{ steps.version.outputs.major }}
-        # Every step is skipped when already done, so re-running a release that
-        # failed part-way (e.g. after the release exists but before the major
-        # tag moved) finishes it instead of reporting nothing to do.
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
-          ref_exists() { gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$1" --silent 2>/dev/null; }
-
+          TAG="v$(jq -r '."."' .release-please-manifest.json)"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists"
-          elif ref_exists "$TAG"; then
+            exit 0
+          fi
+          pending=$(gh pr list --state merged --base main --label "autorelease: pending" --json number --jq length)
+          if [ "$pending" -gt 0 ]; then
+            echo "A merged release-please PR is waiting to be tagged; release-please creates $TAG"
+            exit 0
+          fi
+          # Release from the commit that set the version, not this push: a later
+          # merge may have landed before this job ran.
+          sha=$(git log -1 --format=%H -- .release-please-manifest.json)
+          labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/pulls" --jq '[.[].labels[].name] | join(",")')
+          case ",$labels," in
+            *",autorelease: pending,"* | *",autorelease: tagged,"*)
+              echo "$sha merged a release-please PR; release-please creates $TAG"
+              exit 0 ;;
+          esac
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --silent 2>/dev/null; then
             gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes --latest
           else
-            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --generate-notes --latest
+            gh release create "$TAG" --target "$sha" --title "$TAG" --generate-notes --latest
+          fi
+      - uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.RELEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      # Works from the manifest version rather than release-please's outputs, so
+      # it is idempotent: re-running a job that failed after the release was
+      # created still moves the tag.
+      - name: Move major tag
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          version=$(jq -r '."."' .release-please-manifest.json)
+          TAG="v$version"
+          MAJOR="v${version%%.*}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::No release $TAG for the manifest version; re-run this job"
+            exit 1
           fi
 
           # Point the major tag at the release's commit, not this push's: a
           # later merge that keeps the version must not move it past the release.
           sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)
-          if ref_exists "$MAJOR"; then
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$MAJOR" --silent 2>/dev/null; then
             current=$(gh api "repos/$GITHUB_REPOSITORY/commits/$MAJOR" --jq .sha)
             if [ "$current" = "$sha" ]; then
               echo "::notice::$TAG is released and $MAJOR already points at $sha"
@@ -98,4 +135,4 @@ jobs:
           else
             gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$MAJOR" -f sha="$sha" --silent
           fi
-          echo "::notice::Released $TAG and moved $MAJOR to $sha"
+          echo "::notice::Moved $MAJOR to $TAG ($sha)"

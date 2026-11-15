@@ -1,0 +1,26 @@
+name: PR title
+
+# release-please reads the squash commits on main to pick the next version, and
+# Mergify squashes with the PR title as the commit message (.mergify.yml), so the
+# title must be a Conventional Commit: "fix: ..." releases a patch, "feat: ..." a
+# minor (a patch while the version is 0.x), and "feat!: ..." a breaking change.
+# Types like ci, docs, chore, test and refactor release nothing.
+on:
+  pull_request:
+    # synchronize too: Mergify requires this check on the PR's current head.
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  pull-requests: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-title:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
