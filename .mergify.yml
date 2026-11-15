@@ -1,12 +1,27 @@
+# In-place checks: Mergify updates each queued PR's own branch with main, waits
+# for its checks on that updated head, then merges it. main's branch protection
+# requires branches to be up to date before merging, so the default queue (which
+# tests PRs in a draft PR built on main) is refused: the PR's own branch was
+# never updated. In-place checks need serial mode, batch_size 1, one check at a
+# time, no check retries, and merge_conditions identical to queue_conditions.
+# Keep the two condition lists equal.
 queue_rules:
   - name: default
+    batch_size: 1
+    max_checks_retries: 0
     queue_conditions:
       - base = main
+      - check-success = quality (3.11)
+      - check-success = quality (3.12)
+      - check-success = quality (3.13)
+      - check-success = quality (3.14)
     merge_conditions:
+      - base = main
       - check-success = quality (3.11)
       - check-success = quality (3.12)
       - check-success = quality (3.13)
       - check-success = quality (3.14)
     merge_method: squash
 merge_queue:
+  mode: serial
   max_parallel_checks: 1
