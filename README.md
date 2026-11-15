@@ -146,6 +146,25 @@ pytest
 
 Tests mock the Claude SDK and the `gh` CLI; they make no network calls.
 
+### Releasing
+
+Releases are automated with [release-please](https://github.com/googleapis/release-please).
+PR titles must be [Conventional Commits](https://www.conventionalcommits.org/)
+(a CI check enforces this), because Mergify squash-merges with the PR title as
+the commit message:
+
+| Title | Release |
+|---|---|
+| `fix: ...` | patch |
+| `feat: ...` | patch while the version is 0.x, minor from 1.0 |
+| `feat!: ...` or `fix!: ...` | minor while 0.x, major from 1.0 |
+| `ci:`, `docs:`, `chore:`, `test:`, `refactor:`, ... | none |
+
+release-please keeps a release PR open that bumps the version and
+`CHANGELOG.md`. Merging it publishes the GitHub release and moves the `v0` tag.
+The workflow needs a `RELEASE_TOKEN` secret with contents, pull requests and
+issues write access.
+
 ## License
 
 [MIT](LICENSE)

@@ -15,13 +15,21 @@ queue_rules:
       - check-success = quality (3.12)
       - check-success = quality (3.13)
       - check-success = quality (3.14)
+      - check-success = pr-title
     merge_conditions:
       - base = main
       - check-success = quality (3.11)
       - check-success = quality (3.12)
       - check-success = quality (3.13)
       - check-success = quality (3.14)
+      - check-success = pr-title
     merge_method: squash
+    # release-please reads these squash commits, so each must be exactly the
+    # Conventional Commit PR title that pr-title.yml checks. An empty body keeps
+    # stray "fix: ..." lines in a PR description from counting as changes.
+    commit_message_format:
+      title: pr-title
+      body: empty
 merge_queue:
   mode: serial
   max_parallel_checks: 1
