@@ -209,8 +209,8 @@ A finding counts as **answered** when:
   has this form, and a failing gate prints the instructions in its log (and
   as an error annotation in GitHub Actions). When an acknowledgement was
   written but not counted, the log also says which finding and why: its line
-  has no verdict phrase, it follows another handle on its line, or it was
-  submitted as a review.
+  has no verdict phrase, it follows another handle on its line, it was
+  submitted as a review, or its comment lacks the marker.
 
 ## Configuration
 

@@ -138,6 +138,7 @@ _OVERFLOW_ANSWER_HINT = (
 ACK_WITHOUT_VERDICT = "without-verdict"  # listed on a roll-up line with no verdict phrase
 ACK_NOT_FIRST = "not-first"  # after another handle on a verdict line; only the first counts
 ACK_IN_REVIEW = "in-review"  # written in a review body; only PR comments are read
+ACK_WITHOUT_MARKER = "without-marker"  # a verdict line in a comment with no roll-up marker
 
 
 def _overflow_fingerprint(finding: ReviewFinding) -> str:
@@ -426,6 +427,32 @@ def _parse_overflow_ack_trailing(comment_bodies: list[str]) -> set[str]:
             if any(marker in line for marker in _ALL_COMMENT_TERMINAL_MARKERS):
                 trailing.update(_OVERFLOW_ACK_LINE_RE.findall(line)[1:])
     return trailing
+
+
+def _parse_overflow_ack_unmarked(comment_bodies: list[str]) -> set[str]:
+    """Return the handles a comment *without* the roll-up marker keys a verdict to.
+
+    The first handle on each line that carries a verdict phrase, in a comment
+    lacking :data:`_OVERFLOW_ACK_SENTINEL`: ``of-aaaaaaaa — Fixed automatically``
+    posted as a plain comment is an acknowledgement in every way but the
+    marker, and the gate does not read it.  A handle merely mentioned in
+    discussion, with no verdict on its line, is not collected, and neither is a
+    quoted line or a pasted overflow finding line: a finding whose own text
+    holds a verdict phrase ("... says it is Tracked in #12") is the review being
+    discussed, not answered.  Like :func:`_parse_overflow_ack_listed` this
+    exists only to explain a failing gate.
+    """
+    unmarked: set[str] = set()
+    for body in comment_bodies:
+        if _OVERFLOW_ACK_SENTINEL in body:
+            continue
+        for line in body.splitlines():
+            text = line.strip()
+            if text.startswith(">") or _OVERFLOW_LINE_RE.match(text):
+                continue
+            if any(marker in text for marker in _ALL_COMMENT_TERMINAL_MARKERS):
+                unmarked.update(_OVERFLOW_ACK_LINE_RE.findall(text)[:1])
+    return unmarked
 
 
 def _extract_thread_title(body: str) -> str | None:
@@ -2429,13 +2456,16 @@ class PRReviewer:
     ) -> dict[str, str]:
         """Say why acknowledgements written for *unanswered* findings did not count.
 
-        Three mistakes are worth naming, because the roll-up gives no feedback
+        Four mistakes are worth naming, because the roll-up gives no feedback
         of its own: the handle sits on a roll-up line that has no verdict phrase
         (:data:`ACK_WITHOUT_VERDICT`); it follows another handle on a verdict
         line, where only the first is counted (:data:`ACK_NOT_FIRST`); or the
         roll-up was submitted as a review rather than as a PR comment
         (:data:`ACK_IN_REVIEW`) — a review re-runs the gate, so it is a natural
-        place to answer, but only comments are read.  The reviewer's own review
+        place to answer, but only comments are read; or a verdict line was
+        posted in a comment without the roll-up marker
+        (:data:`ACK_WITHOUT_MARKER`), the likeliest slip of all.  The first
+        reason that applies wins.  The reviewer's own review
         bodies, the ones carrying an overflow block, are never taken for an
         acknowledgement.  Reads only, and only when something is unanswered.
         """
@@ -2443,6 +2473,7 @@ class PRReviewer:
             return {}
         without_verdict = _parse_overflow_ack_listed(comment_bodies)
         not_first = _parse_overflow_ack_trailing(comment_bodies)
+        without_marker = _parse_overflow_ack_unmarked(comment_bodies)
         in_review = _parse_overflow_ack_listed([
             body for body in self._host.get_pr_review_bodies(pr_number)
             if _extract_overflow_block(body) is None
@@ -2456,4 +2487,6 @@ class PRReviewer:
                 notes[finding.fingerprint] = ACK_NOT_FIRST
             elif handles & in_review:
                 notes[finding.fingerprint] = ACK_IN_REVIEW
+            elif handles & without_marker:
+                notes[finding.fingerprint] = ACK_WITHOUT_MARKER
         return notes

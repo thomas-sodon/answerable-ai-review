@@ -16,6 +16,7 @@ from answerable.review import (
     _OVERFLOW_ACK_SENTINEL,
     ACK_IN_REVIEW,
     ACK_NOT_FIRST,
+    ACK_WITHOUT_MARKER,
     ACK_WITHOUT_VERDICT,
     OverflowFinding,
     PostReviewResult,
@@ -719,6 +720,7 @@ class TestRequireCommentReplies:
         (ACK_WITHOUT_VERDICT, "of-abc12345: an acknowledgement comment lists this handle, but on a line with none"),
         (ACK_NOT_FIRST, "of-abc12345: an acknowledgement comment lists this handle after another one on the same line"),
         (ACK_IN_REVIEW, "of-abc12345: an acknowledgement for this handle was submitted as a review"),
+        (ACK_WITHOUT_MARKER, "of-abc12345: a PR comment gives this handle a verdict, but the comment lacks the"),
     ])
     def test_uncounted_acknowledgement_is_explained(
         self, reason: str, expected: str, caplog: pytest.LogCaptureFixture,

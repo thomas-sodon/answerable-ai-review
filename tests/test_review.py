@@ -19,6 +19,7 @@ from answerable.review import (
     _OVERFLOW_SENTINEL_OPEN,
     ACK_IN_REVIEW,
     ACK_NOT_FIRST,
+    ACK_WITHOUT_MARKER,
     ACK_WITHOUT_VERDICT,
     OverflowFinding,
     PostReviewResult,
@@ -34,6 +35,7 @@ from answerable.review import (
     _parse_overflow_ack,
     _parse_overflow_ack_listed,
     _parse_overflow_ack_trailing,
+    _parse_overflow_ack_unmarked,
     _parse_overflow_findings,
 )
 from answerable.sdk import QueryResult, QueryUsage
@@ -1264,6 +1266,18 @@ def test_parse_overflow_ack_trailing_is_every_handle_after_the_first_on_a_verdic
     assert _parse_overflow_ack_trailing(["of-aaaaaaaa, of-bbbbbbbb — Fixed automatically"]) == set()
 
 
+def test_parse_overflow_ack_unmarked_is_a_verdict_line_without_the_sentinel() -> None:
+    """The first handle on a verdict line of a comment lacking the marker is
+    collected; a handle merely mentioned, or one in a marked comment, is not."""
+    assert _parse_overflow_ack_unmarked([
+        "- of-aaaaaaaa, of-bbbbbbbb — Fixed automatically in 1a2b3c4",
+        "What about of-cccccccc?",
+        "> - of-eeeeeeee — Fixed automatically, quoted from someone else",
+        "- of-ffffffff **a.py:3** [bug] — Stale TODO: says it is Tracked in #12",
+        f"{_OVERFLOW_ACK_SENTINEL}\n- of-dddddddd — Fixed automatically",
+    ]) == {"of-aaaaaaaa"}
+
+
 def test_parse_overflow_ack_empty() -> None:
     """No comments and no ack sentinel both yield an empty set."""
     assert _parse_overflow_ack([]) == set()
@@ -2305,6 +2319,24 @@ def test_find_unreplied_comments_notes_a_handle_that_is_not_first_on_its_line() 
 
     assert [f.fingerprint for f in report.overflow] == [fp_second]
     assert report.overflow_notes == {fp_second: ACK_NOT_FIRST}
+
+
+def test_find_unreplied_comments_notes_an_ack_without_the_marker() -> None:
+    """A well-formed verdict line posted in a comment without the roll-up
+    marker is not read; the report names the missing marker.  A comment that
+    only mentions the handle, with no verdict, is not taken for an attempt."""
+    host = MagicMock()
+    reviewer = _reviewer(host)
+    fp = _overflow_fingerprint(_overflow_host(host, reviewer))
+    host.get_pr_comment_bodies.return_value = [f"- {fp} — Fixed automatically in d71aaa8"]
+
+    report = reviewer.find_unreplied_comments(3)
+
+    assert [f.fingerprint for f in report.overflow] == [fp]
+    assert report.overflow_notes == {fp: ACK_WITHOUT_MARKER}
+
+    host.get_pr_comment_bodies.return_value = [f"Is {fp} really a problem?"]
+    assert reviewer.find_unreplied_comments(3).overflow_notes == {}
 
 
 def test_find_unreplied_comments_notes_nothing_when_nobody_acknowledged() -> None:

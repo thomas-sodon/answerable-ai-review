@@ -57,6 +57,7 @@ from answerable.review import (
     _OVERFLOW_ACK_SENTINEL,
     ACK_IN_REVIEW,
     ACK_NOT_FIRST,
+    ACK_WITHOUT_MARKER,
     ACK_WITHOUT_VERDICT,
     PRReviewer,
     _extract_thread_title,
@@ -87,6 +88,10 @@ _OVERFLOW_ACK_NOTES = {
     ACK_IN_REVIEW: (
         "an acknowledgement for this handle was submitted as a review; only PR "
         "conversation comments are read, so it was not counted"
+    ),
+    ACK_WITHOUT_MARKER: (
+        "a PR comment gives this handle a verdict, but the comment lacks the "
+        f"{_OVERFLOW_ACK_SENTINEL} marker, so it was not read as an acknowledgement"
     ),
 }
 
